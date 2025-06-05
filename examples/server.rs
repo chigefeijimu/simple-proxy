@@ -14,9 +14,9 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 use std::{
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
+    net::SocketAddr, sync::{atomic::AtomicU64, Arc}, time::Duration
 };
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
@@ -64,55 +64,56 @@ async fn main() {
         .with_state(app_state);
 
     // 启动服务器
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap();
-    tracing::debug!("监听端口 {}", listener.local_addr().unwrap());
+    info!("Server running on http://{}", addr);
     axum::serve(listener, app).await.unwrap();
 }
 
 // 用户模型
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct User {
-    id: u64,
-    email: String,
+pub struct User {
+    pub id: u64,
+    pub email: String,
     #[serde(skip_serializing)]
-    password: String,
-    name: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    pub password: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // 创建用户请求
 #[derive(Debug, Deserialize)]
-struct CreateUserRequest {
-    email: String,
-    password: String,
-    name: String,
+pub struct CreateUserRequest {
+    pub email: String,
+    pub password: String,
+    pub name: String,
 }
 
 // 更新用户请求
 #[derive(Debug, Deserialize)]
-struct UpdateUserRequest {
-    email: Option<String>,
-    password: Option<String>,
-    name: Option<String>,
+pub struct UpdateUserRequest {
+    pub email: Option<String>,
+    pub password: Option<String>,
+    pub name: Option<String>,
 }
 
 // 应用状态
 #[derive(Clone)]
-struct AppState {
-    inner: Arc<AppStateInner>,
+pub struct AppState {
+    pub(crate) inner: Arc<AppStateInner>,
 }
 
-struct AppStateInner {
-    next_id: AtomicU64,
-    users: DashMap<u64, User>,
-    argon2: Argon2<'static>,
+pub(crate) struct AppStateInner {
+    pub(crate) next_id: AtomicU64,
+    pub(crate) users: DashMap<u64, User>,
+    pub(crate) argon2: Argon2<'static>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(AppStateInner {
                 next_id: AtomicU64::new(1),
@@ -122,17 +123,21 @@ impl AppState {
         }
     }
 
-    fn get_user(&self, id: u64) -> Option<User> {
+    pub fn get_users(&self) -> Vec<User> {
+        self.inner.users.iter().map(|entry| entry.clone()).collect()
+    }
+
+    pub fn get_user(&self, id: u64) -> Option<User> {
         self.inner.users.get(&id).map(|user| user.clone())
     }
 
-    fn create_user(&self, req: CreateUserRequest) -> Result<User, String> {
+    pub fn create_user(&self, req: CreateUserRequest) -> Result<User, anyhow::Error> {
         let salt = SaltString::generate(&mut OsRng);
         let password_hash = self
             .inner
             .argon2
             .hash_password(req.password.as_bytes(), &salt)
-            .map_err(|e| format!("密码哈希失败: {}", e))?
+            .map_err(|_| anyhow::anyhow!("Failed to hash password"))?
             .to_string();
 
         let id = self
@@ -154,40 +159,54 @@ impl AppState {
         Ok(user)
     }
 
-    fn update_user(&self, id: u64, req: UpdateUserRequest) -> Result<Option<User>, String> {
-        if let Some(mut user) = self.inner.users.get_mut(&id) {
+    pub fn update_user(&self, id: u64, req: UpdateUserRequest) -> Result<Option<User>, String> {
+        if let Some(mut entry) = self.inner.users.get_mut(&id) {
+            println!("找到用户 ID: {}", id);
+            let mut user = entry.value().clone();
+
+            // 更新字段
             if let Some(email) = req.email {
+                println!("更新邮箱为: {}", email);
                 user.email = email;
             }
 
             if let Some(name) = req.name {
+                println!("更新名称为: {}", name);
                 user.name = name;
             }
 
             if let Some(password) = req.password {
-                let salt = SaltString::generate(&mut OsRng);
-                let password_hash = self
-                    .inner
-                    .argon2
-                    .hash_password(password.as_bytes(), &salt)
-                    .map_err(|e| format!("密码哈希失败: {}", e))?
-                    .to_string();
-                user.password = password_hash;
+                println!("开始更新密码");
+                match hash_password(&self.inner.argon2, &password) {
+                    Ok(hashed) => {
+                        user.password = hashed;
+                        println!("密码更新完成");
+                    }
+                    Err(e) => {
+                        println!("密码更新失败: {}", e);
+                        return Err(format!("密码更新失败: {}", e));
+                    }
+                }
             }
 
             user.updated_at = Utc::now();
-            let updated_user = user.clone();
-            Ok(Some(updated_user))
+            println!("更新时间戳");
+            
+            // 更新存储
+            println!("保存更新后的用户信息");
+            *entry.value_mut() = user.clone();
+            Ok(Some(user))
         } else {
+            println!("未找到用户 ID: {}", id);
             Ok(None)
         }
     }
 
-    fn delete_user(&self, id: u64) -> Option<User> {
+    pub fn delete_user(&self, id: u64) -> Option<User> {
         self.inner.users.remove(&id).map(|(_, user)| user)
     }
 
-    fn health(&self) -> &'static str {
+    pub fn health(&self) -> &'static str {
         "健康状态: 正常"
     }
 }
@@ -196,6 +215,14 @@ impl AppState {
 async fn get_users(State(state): State<AppState>) -> impl IntoResponse {
     let users: Vec<User> = state.inner.users.iter().map(|entry| entry.clone()).collect();
     Json(users)
+}
+
+fn hash_password(argon2: &Argon2<'static>, password: &str) -> Result<String, anyhow::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = argon2.hash_password(password.as_bytes(), &salt)
+        .map_err(|_| anyhow::anyhow!("Failed to hash password"))?
+        .to_string();
+    Ok(password_hash)
 }
 
 async fn get_user(
@@ -215,7 +242,7 @@ async fn create_user(
     state
         .create_user(req)
         .map(|user| (StatusCode::CREATED, Json(user)))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn update_user(
@@ -242,4 +269,146 @@ async fn delete_user(
 
 async fn health(State(state): State<AppState>) -> &'static str {
     state.health()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> AppState {
+        AppState::new()
+    }
+
+    fn create_test_user(state: &AppState, email: &str, name: &str) -> User {
+        let req = CreateUserRequest {
+            email: email.to_string(),
+            password: "password123".to_string(),
+            name: name.to_string(),
+        };
+        state.create_user(req).unwrap()
+    }
+
+    #[test]
+    fn test_get_users() {
+        let state = setup();
+        
+        // 创建多个测试用户
+        let user1 = create_test_user(&state, "user1@example.com", "User One");
+        let user2 = create_test_user(&state, "user2@example.com", "User Two");
+        let user3 = create_test_user(&state, "user3@example.com", "User Three");
+
+        // 获取所有用户
+        let users: Vec<User> = state.inner.users.iter().map(|entry| entry.clone()).collect();
+        
+        // 验证用户数量
+        assert_eq!(users.len(), 3);
+
+        // 验证用户信息
+        assert!(users.iter().any(|u| u.id == user1.id && u.email == user1.email && u.name == user1.name));
+        assert!(users.iter().any(|u| u.id == user2.id && u.email == user2.email && u.name == user2.name));
+        assert!(users.iter().any(|u| u.id == user3.id && u.email == user3.email && u.name == user3.name));
+    }
+
+    #[test]
+    fn test_create_user() {
+        let state = setup();
+        let req = CreateUserRequest {
+            email: "test@example.com".to_string(),
+            password: "password123".to_string(),
+            name: "Test User".to_string(),
+        };
+
+        let result = state.create_user(req).unwrap();
+        assert_eq!(result.email, "test@example.com");
+        assert_eq!(result.name, "Test User");
+        assert_eq!(result.id, 1);
+    }
+
+    #[test]
+    fn test_get_user() {
+        let state = setup();
+        let req = CreateUserRequest {
+            email: "test@example.com".to_string(),
+            password: "password123".to_string(),
+            name: "Test User".to_string(),
+        };
+
+        let created_user = state.create_user(req).unwrap();
+        let retrieved_user = state.get_user(created_user.id).unwrap();
+
+        assert_eq!(retrieved_user.id, created_user.id);
+        assert_eq!(retrieved_user.email, created_user.email);
+        assert_eq!(retrieved_user.name, created_user.name);
+    }
+
+    #[test]
+    fn test_update_user() {
+        let state = setup();
+        let req = CreateUserRequest {
+            email: "test@example.com".to_string(),
+            password: "password123".to_string(),
+            name: "Test User".to_string(),
+        };
+
+        let created_user = state.create_user(req).unwrap();
+        
+        let update_req = UpdateUserRequest {
+            email: Some("updated@example.com".to_string()),
+            password: None,
+            name: Some("Updated Name".to_string()),
+        };
+
+        let updated_user = state.update_user(created_user.id, update_req).unwrap().unwrap();
+        
+        assert_eq!(updated_user.email, "updated@example.com");
+        assert_eq!(updated_user.name, "Updated Name");
+        assert_eq!(updated_user.id, created_user.id);
+    }
+
+    #[test]
+    fn test_delete_user() {
+        let state = setup();
+        let req = CreateUserRequest {
+            email: "test@example.com".to_string(),
+            password: "password123".to_string(),
+            name: "Test User".to_string(),
+        };
+
+        let created_user = state.create_user(req).unwrap();
+        let deleted_user = state.delete_user(created_user.id).unwrap();
+        
+        assert_eq!(deleted_user.id, created_user.id);
+        assert!(state.get_user(created_user.id).is_none());
+    }
+
+    #[test]
+    fn test_get_nonexistent_user() {
+        let state = setup();
+        assert!(state.get_user(999).is_none());
+    }
+
+    #[test]
+    fn test_update_nonexistent_user() {
+        let state = setup();
+        let update_req = UpdateUserRequest {
+            email: Some("updated@example.com".to_string()),
+            password: None,
+            name: Some("Updated Name".to_string()),
+        };
+
+        let result = state.update_user(999, update_req).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_user() {
+        let state = setup();
+        assert!(state.delete_user(999).is_none());
+    }
+
+    #[test]
+    fn test_health_check() {
+        let state = setup();
+        assert_eq!(state.health(), "健康状态: 正常");
+    }
 } 
